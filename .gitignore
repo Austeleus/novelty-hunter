@@ -1,0 +1,30 @@
+# Data and descriptions
+project_data/
+project_description.txt
+
+# Virtual environment
+venv/
+
+# Outputs
+outputs/
+outputs_final/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
