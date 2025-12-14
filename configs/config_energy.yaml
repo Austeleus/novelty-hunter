@@ -1,0 +1,137 @@
+# Novelty Hunter Configuration
+
+# Data paths
+data:
+  train_csv: "project_data/train_data.csv"
+  train_images: "project_data/train_images"
+  test_images: "project_data/test_images"
+  superclass_mapping: "project_data/superclass_mapping.csv"
+  subclass_mapping: "project_data/subclass_mapping.csv"
+
+# Dataset settings
+dataset:
+  image_size: 224
+  num_superclasses: 3
+  num_subclasses: 87
+  novel_superclass_idx: 3
+  novel_subclass_idx: 87
+
+# Validation split strategy
+split:
+  strategy: "holdout_subclasses"
+  val_ratio: 0.15
+  holdout_subclasses_per_super: 3
+  seed: 42
+
+# Model architecture
+model:
+  backbone: "vit_base_patch16_224"
+  pretrained: true
+  freeze_backbone: false
+  feature_dim: 768
+  dropout: 0.1
+  use_cls_token: true
+
+# Classification heads
+heads:
+  superclass:
+    hidden_dims: [512, 256]
+    num_classes: 3
+  subclass:
+    hidden_dims: [512, 256]
+    num_classes: 87
+
+# Training settings
+training:
+  batch_size: 16
+  accumulation_steps: 4
+  num_epochs: 50
+  early_stopping_patience: 10
+
+# Optimizer
+optimizer:
+  name: "AdamW"
+  lr: 1.0e-4
+  backbone_lr: 1.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+# Scheduler
+scheduler:
+  name: "CosineAnnealingWarmRestarts"
+  T_0: 10
+  T_mult: 2
+  eta_min: 1.0e-7
+  warmup_epochs: 3
+  warmup_lr: 1.0e-6
+
+# Loss functions
+loss:
+  superclass:
+    type: "CrossEntropyLoss"
+    label_smoothing: 0.1
+    weight: 1.0
+  subclass:
+    type: "FocalLoss"
+    gamma: 2.0
+    label_smoothing: 0.1
+    weight: 1.0
+
+# Augmentation
+augmentation:
+  train:
+    resize: 256
+    random_crop: 224
+    horizontal_flip: 0.5
+    color_jitter:
+      brightness: 0.3
+      contrast: 0.3
+      saturation: 0.3
+      hue: 0.1
+    random_rotation: 15
+    random_erasing: 0.2
+    mixup_alpha: 0.2
+    cutmix_alpha: 1.0
+    randaugment_n: 2
+    randaugment_m: 9
+  val:
+    resize: 256
+    center_crop: 224
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+# OOD Detection
+ood:
+  energy:
+    temperature: 1.0
+  mahalanobis:
+    tied_covariance: true
+  combination:
+    method: "weighted_sum"
+    energy_weight: 1.0       # Energy-only approach
+    mahalanobis_weight: 0.0  # Disabled for energy comparison
+  threshold:
+    superclass: 0.5          # Will be tuned
+    subclass: 0.5            # Will be tuned
+    tuning_metric: "f1"
+
+# Calibration
+calibration:
+  method: "temperature_scaling"
+  temperature_superclass: 1.0
+  temperature_subclass: 1.0
+
+# Inference
+inference:
+  batch_size: 32
+  use_tta: false
+  tta_transforms: 5
+
+# Logging
+logging:
+  tensorboard_dir: "outputs/logs"
+  checkpoint_dir: "outputs/checkpoints"
+  log_interval: 50
+  save_best_only: true
+  monitor: "val_combined"
