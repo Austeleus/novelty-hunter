@@ -108,7 +108,7 @@ def main():
     # Load model
     print(f"\nLoading model from {args.checkpoint}...")
     model = create_model(cfg)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
@@ -123,15 +123,19 @@ def main():
     else:
         # Load OOD detector
         print(f"\nLoading OOD detector from {args.ood_detector}...")
-        ood_detector = create_ood_detector(cfg, device=device)
 
         if os.path.exists(args.ood_detector):
-            ood_state = torch.load(args.ood_detector, map_location=device)
+            # First load the state to check if raw mode was used
+            ood_state = torch.load(args.ood_detector, map_location=device, weights_only=False)
+            use_raw_mahal = ood_state.get('use_raw_mahal', False)
+
+            # Create detector with the correct mode
+            ood_detector = create_ood_detector(cfg, device=device, use_raw_mahal=use_raw_mahal)
             ood_detector.load_state_dict(ood_state)
-            print("  OOD detector loaded successfully")
+            print(f"  OOD detector loaded successfully (raw_mahal={use_raw_mahal})")
         else:
             print(f"  ERROR: OOD detector file not found at {args.ood_detector}")
-            print("  Please run tune_thresholds.py first to create the OOD detector,")
+            print("  Please run fit_ood_full.py first to create the OOD detector,")
             print("  or use --no-ood flag for simple predictions without OOD detection.")
             sys.exit(1)
 
@@ -140,7 +144,7 @@ def main():
         if os.path.exists(args.calibrator):
             print(f"\nLoading calibrator from {args.calibrator}...")
             calibrator = TemperatureScaling()
-            cal_state = torch.load(args.calibrator, map_location=device)
+            cal_state = torch.load(args.calibrator, map_location=device, weights_only=False)
             calibrator.load_state_dict(cal_state)
             print("  Calibrator loaded successfully")
 

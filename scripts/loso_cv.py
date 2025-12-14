@@ -7,6 +7,14 @@ OOD detector exactly: energy, Mahalanobis, and combined (normalized + weighted).
 
 import os
 import sys
+
+# Limit numpy/BLAS threads BEFORE importing numpy to avoid conflicts
+# with PyTorch DataLoader multiprocessing workers
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import argparse
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
@@ -115,7 +123,7 @@ def train_loso_fold(
         train_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
         pin_memory=True,
         collate_fn=collate_fn_with_holdout,
         drop_last=True
@@ -433,7 +441,7 @@ def main():
             train_fit_dataset,
             batch_size=cfg.training.batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=4,
             collate_fn=collate_fn_with_holdout
         )
 
@@ -455,7 +463,7 @@ def main():
             val_id_dataset,
             batch_size=cfg.training.batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=4,
             collate_fn=collate_fn_with_holdout
         )
 
@@ -463,7 +471,7 @@ def main():
             val_ood_dataset,
             batch_size=cfg.training.batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=4,
             collate_fn=collate_fn_with_holdout
         )
 

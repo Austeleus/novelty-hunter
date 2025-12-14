@@ -3,6 +3,14 @@
 
 import os
 import sys
+
+# Limit numpy/BLAS threads BEFORE importing numpy to avoid conflicts
+# with PyTorch DataLoader multiprocessing workers
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import argparse
 
 # Add project root to path

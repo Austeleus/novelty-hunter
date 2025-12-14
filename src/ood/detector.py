@@ -1,6 +1,8 @@
 """Combined OOD detector using Energy Score and Mahalanobis Distance."""
 
 from typing import Dict, Tuple, Optional
+import gc
+import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -10,6 +12,14 @@ from .energy_score import EnergyScoreDetector, EnergyScoreNormalizer
 from .mahalanobis import MahalanobisDetector, MahalanobisNormalizer
 
 
+def _limit_numpy_threads():
+    """Limit numpy/BLAS threads to avoid conflicts with PyTorch DataLoader workers."""
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
+
 class OODDetector:
     """
     Combined OOD detector using Energy Score and Mahalanobis Distance.
@@ -17,25 +27,29 @@ class OODDetector:
     Decision flow:
     1. Compute energy scores for superclass and subclass logits (if energy_weight > 0)
     2. Compute Mahalanobis distances for head features (if mahal_weight > 0)
-    3. Combine scores using weighted sum
+    3. Combine scores using weighted sum (or use raw scores if use_raw_mahal=True)
     4. Apply thresholds to determine OOD status
 
     Supports Mahalanobis-only mode when energy_weight=0 for better performance.
+    Supports raw Mahalanobis mode when use_raw_mahal=True (recommended for best OOD detection).
 
     Args:
         cfg: Configuration object with OOD parameters
         penultimate_dim: Dimension of penultimate layer features (default: 256)
         device: Device for computation
+        use_raw_mahal: If True, use raw Mahalanobis distances without normalization (recommended)
     """
 
     def __init__(
         self,
         cfg,
         penultimate_dim: int = 256,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        use_raw_mahal: bool = False
     ):
         self.cfg = cfg
         self.device = device
+        self.use_raw_mahal = use_raw_mahal
 
         # Combination weights
         self.energy_weight = cfg.ood.combination.energy_weight
@@ -89,7 +103,8 @@ class OODDetector:
         if self.use_energy:
             mode.append(f"energy(w={self.energy_weight})")
         if self.use_mahal:
-            mode.append(f"mahalanobis(w={self.mahal_weight})")
+            mahal_mode = "raw" if self.use_raw_mahal else f"normalized(w={self.mahal_weight})"
+            mode.append(f"mahalanobis({mahal_mode})")
         print(f"OOD Detector mode: {' + '.join(mode) if mode else 'NONE (disabled)'}")
 
     def fit(self, model: nn.Module, train_loader: DataLoader):
@@ -100,7 +115,7 @@ class OODDetector:
             model: Trained NoveltyHunterModel
             train_loader: DataLoader for training data
         """
-        print("Fitting OOD detector on training data...")
+        print("Fitting OOD detector on training data...", flush=True)
         model.eval()
 
         # Collect features and labels
@@ -132,6 +147,17 @@ class OODDetector:
                     super_energies_list.append(super_energy.cpu())
                     sub_energies_list.append(sub_energy.cpu())
 
+        # Explicitly cleanup DataLoader workers before numpy operations
+        # This prevents multiprocessing/threading conflicts with numpy's BLAS
+        if hasattr(train_loader, '_iterator') and train_loader._iterator is not None:
+            train_loader._iterator._shutdown_workers()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Limit numpy threads to avoid BLAS/OpenMP conflicts with DataLoader workers
+        _limit_numpy_threads()
+
         # Fit Mahalanobis detectors
         if self.use_mahal:
             super_features = torch.cat(super_features_list, dim=0)
@@ -139,7 +165,7 @@ class OODDetector:
             super_labels = torch.cat(super_labels_list, dim=0)
             sub_labels = torch.cat(sub_labels_list, dim=0)
 
-            print("Fitting Mahalanobis detectors...")
+            print("Fitting Mahalanobis detectors...", flush=True)
             self.mahal_super.fit(super_features, super_labels)
             self.mahal_sub.fit(sub_features, sub_labels)
 
@@ -152,7 +178,7 @@ class OODDetector:
             )
 
             # Fit Mahalanobis normalizers
-            print("Fitting Mahalanobis normalizers...")
+            print("Fitting Mahalanobis normalizers...", flush=True)
             self.super_mahal_normalizer.fit(super_mahal_dists.cpu())
             self.sub_mahal_normalizer.fit(sub_mahal_dists.cpu())
 
@@ -161,12 +187,12 @@ class OODDetector:
             super_energies = torch.cat(super_energies_list, dim=0)
             sub_energies = torch.cat(sub_energies_list, dim=0)
 
-            print("Fitting energy normalizers...")
+            print("Fitting energy normalizers...", flush=True)
             self.super_energy_normalizer.fit(super_energies)
             self.sub_energy_normalizer.fit(sub_energies)
 
         self.fitted = True
-        print("OOD detector fitted successfully!")
+        print("OOD detector fitted successfully!", flush=True)
 
     def compute_scores(
         self,
@@ -216,10 +242,17 @@ class OODDetector:
                 sub_mahal, _ = self.mahal_sub.compute_distance(
                     features['sub_penultimate'], self.device
                 )
-                super_mahal_norm = self.super_mahal_normalizer.normalize(super_mahal)
-                sub_mahal_norm = self.sub_mahal_normalizer.normalize(sub_mahal)
-                super_score = super_score + self.mahal_weight * super_mahal_norm
-                sub_score = sub_score + self.mahal_weight * sub_mahal_norm
+
+                if self.use_raw_mahal:
+                    # Use raw Mahalanobis distances directly (recommended for best OOD detection)
+                    super_score = super_mahal
+                    sub_score = sub_mahal
+                else:
+                    # Use normalized scores with weighted combination
+                    super_mahal_norm = self.super_mahal_normalizer.normalize(super_mahal)
+                    sub_mahal_norm = self.sub_mahal_normalizer.normalize(sub_mahal)
+                    super_score = super_score + self.mahal_weight * super_mahal_norm
+                    sub_score = sub_score + self.mahal_weight * sub_mahal_norm
 
         return super_score, sub_score, super_logits, sub_logits
 
@@ -248,9 +281,10 @@ class OODDetector:
         _, sub_pred_base = torch.max(sub_logits, dim=1)
 
         # Apply OOD detection using thresholds
-        # Use >= because scores are clamped to [0,1] and threshold=1.0 means "score at max"
-        super_is_ood = super_score >= self.super_threshold
-        sub_is_ood = sub_score >= self.sub_threshold
+        # Use > (not >=) because scores are clamped to [0,1], and with threshold=1.0
+        # we don't want samples at exactly 1.0 to be flagged as OOD
+        super_is_ood = super_score > self.super_threshold
+        sub_is_ood = sub_score > self.sub_threshold
 
         # Final predictions
         super_pred = super_pred_base.clone()
@@ -283,6 +317,7 @@ class OODDetector:
             'fitted': self.fitted,
             'use_energy': self.use_energy,
             'use_mahal': self.use_mahal,
+            'use_raw_mahal': self.use_raw_mahal,
             'energy_weight': self.energy_weight,
             'mahal_weight': self.mahal_weight,
         }
@@ -320,13 +355,14 @@ class OODDetector:
             self.sub_energy_normalizer.load_state_dict(state_dict['sub_energy_normalizer'])
 
 
-def create_ood_detector(cfg, device: str = 'cuda') -> OODDetector:
+def create_ood_detector(cfg, device: str = 'cuda', use_raw_mahal: bool = False) -> OODDetector:
     """
     Factory function to create OOD detector.
 
     Args:
         cfg: Configuration object
         device: Device for computation
+        use_raw_mahal: If True, use raw Mahalanobis distances (recommended for best OOD detection)
 
     Returns:
         OODDetector instance
@@ -334,4 +370,4 @@ def create_ood_detector(cfg, device: str = 'cuda') -> OODDetector:
     # Get penultimate dimension from head config
     penultimate_dim = cfg.heads.superclass.hidden_dims[-1]
 
-    return OODDetector(cfg, penultimate_dim=penultimate_dim, device=device)
+    return OODDetector(cfg, penultimate_dim=penultimate_dim, device=device, use_raw_mahal=use_raw_mahal)
