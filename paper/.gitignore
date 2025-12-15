@@ -1,0 +1,22 @@
+# LaTeX build artifacts
+*.aux
+*.log
+*.bbl
+*.blg
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.nav
+*.snm
+*.vrb
+
+# Compiled PDF (regenerate from source)
+*.pdf
+
+# Keep figure PDFs
+!figures/*.pdf
+
+# Skip PNG previews (can regenerate)
+figures/*.png

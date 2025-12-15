@@ -1,0 +1,464 @@
+\documentclass{article}
+
+% NeurIPS 2023 style
+\usepackage[final]{neurips2023}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{multirow}
+\usepackage{subcaption}
+\usepackage{placeins}  % For \FloatBarrier
+
+\newtheorem{definition}{Definition}
+\newtheorem{conjecture}{Conjecture}
+
+\title{Novelty Hunter: Hierarchical Out-of-Distribution Detection with Dual-Head Vision Transformers}
+
+\author{
+  Anonymous Author \\
+  Department of Computer Science\\
+  University Name\\
+  \texttt{anonymous@email.com}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present \textbf{Novelty Hunter}, a hierarchical image classification system that jointly detects novel categories at multiple semantic granularities. Given images of animals, our system classifies known species while identifying both novel species within known animal types (subclass novelty) and entirely new animal types (superclass novelty). We employ a Vision Transformer (ViT-Base) backbone with dual classification heads and compare two out-of-distribution (OOD) detection approaches: Mahalanobis distance in feature space and energy-based scoring on classifier outputs. Our experiments reveal that Mahalanobis distance significantly outperforms energy-based detection for coarse-grained novelty ($+49$ percentage points on unseen superclasses), while energy-based methods show competitive performance for fine-grained novelty detection. We achieve $95.3\%$ accuracy on seen superclasses, $91.8\%$ on unseen superclasses, and $96.7\%$ on seen subclasses using the Mahalanobis approach. Our analysis provides practical insights into when each OOD detection method should be preferred based on the semantic granularity of the novelty detection task.
+\end{abstract}
+
+\section{Introduction}
+
+Real-world deployment of image classification systems requires the ability to handle inputs that fall outside the training distribution. Traditional classifiers assign high confidence to out-of-distribution (OOD) samples, leading to silent failures \cite{nguyen2015deep}. This limitation is particularly problematic in domains where novel categories may emerge over time, such as wildlife monitoring, medical imaging, and autonomous systems.
+
+We address the problem of \textbf{hierarchical novelty detection}: identifying novel samples at multiple levels of a semantic hierarchy. Consider an animal classification system trained on birds, dogs, and reptiles, each with multiple species (subclasses). At deployment, the system may encounter:
+\begin{itemize}
+    \item \textbf{Novel subclasses}: A new dog breed not seen during training
+    \item \textbf{Novel superclasses}: An entirely new animal type (e.g., a fish)
+\end{itemize}
+
+These two types of novelty require different detection strategies. Novel subclasses share semantic features with known classes and require fine-grained discrimination, while novel superclasses may exhibit fundamentally different visual characteristics.
+
+Our contributions are:
+\begin{enumerate}
+    \item A dual-head Vision Transformer architecture for hierarchical classification with OOD detection at multiple granularities
+    \item A comprehensive comparison of Mahalanobis distance and energy-based OOD detection for hierarchical novelty
+    \item Empirical evidence that feature-space methods (Mahalanobis) excel at coarse-grained novelty while output-space methods (energy) are competitive for fine-grained novelty
+    \item A Leave-One-Superclass-Out (LOSO) cross-validation framework for threshold calibration
+\end{enumerate}
+
+\section{Related Work}
+
+\paragraph{Out-of-Distribution Detection} OOD detection methods can be categorized by where they operate in the neural network pipeline. \textit{Output-based methods} use classifier predictions: Maximum Softmax Probability (MSP) \cite{hendrycks2017baseline}, ODIN \cite{liang2018enhancing}, and Energy-based detection \cite{liu2020energy}. \textit{Feature-based methods} analyze internal representations: Mahalanobis distance \cite{lee2018simple}, feature norms, and contrastive methods. Recent work combines multiple signals for improved detection \cite{sun2022out}.
+
+\paragraph{Hierarchical Classification} Learning with class hierarchies improves generalization and enables structured predictions \cite{silla2011survey}. Multi-head architectures predict at different hierarchy levels simultaneously \cite{wehrmann2018hierarchical}. Our work extends this to novelty detection at each level.
+
+\paragraph{Vision Transformers} ViT \cite{dosovitskiy2020image} and its variants have become standard backbones for image classification. The [CLS] token provides a natural global representation suitable for OOD detection \cite{fort2021exploring}.
+
+\section{Problem Formulation}
+
+Let $\mathcal{X} \subseteq \mathbb{R}^{H \times W \times 3}$ be the input space of RGB images. We define a two-level class hierarchy:
+\begin{itemize}
+    \item \textbf{Superclasses} $\mathcal{Y}^{(s)} = \{0, 1, \ldots, K^{(s)}-1\}$: Coarse categories (e.g., bird, dog, reptile)
+    \item \textbf{Subclasses} $\mathcal{Y}^{(b)} = \{0, 1, \ldots, K^{(b)}-1\}$: Fine-grained categories within superclasses
+\end{itemize}
+
+Each subclass $j$ belongs to exactly one superclass, defining a mapping $\pi: \mathcal{Y}^{(b)} \rightarrow \mathcal{Y}^{(s)}$.
+
+At test time, we may encounter:
+\begin{itemize}
+    \item \textbf{In-distribution samples}: $(x, y^{(s)}, y^{(b)})$ where $y^{(s)} \in \mathcal{Y}^{(s)}$ and $y^{(b)} \in \mathcal{Y}^{(b)}$
+    \item \textbf{Novel subclass samples}: $y^{(s)} \in \mathcal{Y}^{(s)}$ but $y^{(b)} \notin \mathcal{Y}^{(b)}$
+    \item \textbf{Novel superclass samples}: $y^{(s)} \notin \mathcal{Y}^{(s)}$ (implies $y^{(b)} \notin \mathcal{Y}^{(b)}$)
+\end{itemize}
+
+\begin{definition}[Hierarchical OOD Detection]
+Given an input $x$, the goal is to produce predictions $(\hat{y}^{(s)}, \hat{y}^{(b)})$ where:
+\begin{equation}
+\hat{y}^{(s)} = \begin{cases}
+\arg\max_k p(y^{(s)}=k|x) & \text{if } S^{(s)}(x) \leq \tau^{(s)} \\
+\text{NOVEL} & \text{otherwise}
+\end{cases}
+\end{equation}
+and similarly for $\hat{y}^{(b)}$ using score $S^{(b)}(x)$ and threshold $\tau^{(b)}$.
+\end{definition}
+
+\section{Method}
+
+\subsection{Model Architecture}
+
+Our architecture consists of three components: (1) a shared ViT backbone, (2) a superclass classification head, and (3) a subclass classification head.
+
+\paragraph{Backbone} We use a ViT-Base/16 \cite{dosovitskiy2020image} backbone from \texttt{timm} (\texttt{vit\_base\_patch16\_224}, pretrained weights tag \texttt{augreg2\_in21k\_ft\_in1k}). Given an input image $x \in \mathbb{R}^{224 \times 224 \times 3}$, the backbone produces:
+\begin{equation}
+    f_\theta(x) = \text{ViT}(x)_{\text{[CLS]}} \in \mathbb{R}^{768}
+\end{equation}
+
+\paragraph{Classification Heads} Each head is a multi-layer perceptron with layer normalization and GELU activation:
+\begin{align}
+    h^{(s)} &= \text{MLP}^{(s)}(f_\theta(x)) = W_2^{(s)} \cdot \text{GELU}(\text{LN}(W_1^{(s)} \cdot f_\theta(x))) \\
+    z^{(s)} &= W_{\text{out}}^{(s)} \cdot h^{(s)} \in \mathbb{R}^{K^{(s)}}
+\end{align}
+where $W_1^{(s)} \in \mathbb{R}^{512 \times 768}$, $W_2^{(s)} \in \mathbb{R}^{256 \times 512}$, and $W_{\text{out}}^{(s)} \in \mathbb{R}^{K^{(s)} \times 256}$. The subclass head $h^{(b)}, z^{(b)}$ follows the same architecture.
+
+The penultimate features $h^{(s)}, h^{(b)} \in \mathbb{R}^{256}$ are used for Mahalanobis distance computation.
+
+\subsection{Training Objective}
+
+We minimize a combined loss over both heads:
+\begin{equation}
+    \mathcal{L} = \lambda_s \mathcal{L}^{(s)} + \lambda_b \mathcal{L}^{(b)}
+\end{equation}
+
+\paragraph{Superclass Loss} Label-smoothed cross-entropy for calibrated predictions:
+\begin{equation}
+    \mathcal{L}^{(s)} = -\sum_{k=1}^{K^{(s)}} \tilde{y}_k^{(s)} \log \text{softmax}(z^{(s)})_k
+\end{equation}
+where $\tilde{y}_k^{(s)}$ uses label smoothing (as implemented in our codebase):
+\begin{equation}
+    \tilde{y}_k^{(s)} =
+    \begin{cases}
+    1-\epsilon & k=y^{(s)} \\
+    \epsilon/(K^{(s)}-1) & \text{otherwise}
+    \end{cases}
+\end{equation}
+with smoothing factor $\epsilon=0.1$.
+
+\paragraph{Subclass Loss} Focal loss \cite{lin2017focal} to handle class imbalance:
+\begin{equation}
+    \mathcal{L}^{(b)} = -\sum_{k=1}^{K^{(b)}} (1 - p_k)^\gamma \tilde{y}_k^{(b)} \log p_k
+\end{equation}
+where $p_k = \text{softmax}(z^{(b)})_k$ and $\gamma=2.0$.
+
+\subsection{OOD Detection Methods}
+
+We compare two approaches for computing OOD scores $S(x)$.
+
+\subsubsection{Mahalanobis Distance}
+
+Following \cite{lee2018simple}, we model class-conditional feature distributions as multivariate Gaussians. For each class $c$, we estimate:
+\begin{align}
+    \boldsymbol{\mu}_c &= \frac{1}{N_c} \sum_{i: y_i = c} h(x_i) \\
+    \boldsymbol{\Sigma} &= \frac{1}{N} \sum_{c=1}^{K} \sum_{i: y_i = c} (h(x_i) - \boldsymbol{\mu}_c)(h(x_i) - \boldsymbol{\mu}_c)^\top
+\end{align}
+
+The Mahalanobis distance to the nearest class is:
+\begin{equation}
+    S_{\text{Mahal}}(x) = \min_{c \in \{1,\ldots,K\}} (h(x) - \boldsymbol{\mu}_c)^\top \boldsymbol{\Sigma}^{-1} (h(x) - \boldsymbol{\mu}_c)
+\end{equation}
+
+Higher distance indicates higher likelihood of being OOD.
+
+\subsubsection{Energy-Based Detection}
+
+Energy-based OOD detection \cite{liu2020energy} uses the free energy of the classifier output:
+\begin{equation}
+    S_{\text{Energy}}(x) = -T \cdot \log \sum_{k=1}^{K} \exp(z_k / T)
+\end{equation}
+
+where $T$ is a temperature parameter. Higher (less negative) energy indicates OOD.
+
+\begin{algorithm}[t]
+\caption{Hierarchical Novelty Detection with Mahalanobis Distance}
+\label{alg:inference}
+\begin{algorithmic}[1]
+\REQUIRE Test image $x$, trained model $f_\theta$, class statistics $\{\boldsymbol{\mu}_c^{(s)}, \boldsymbol{\mu}_c^{(b)}, \boldsymbol{\Sigma}^{(s)}, \boldsymbol{\Sigma}^{(b)}\}$, thresholds $\tau^{(s)}, \tau^{(b)}$
+\ENSURE Predictions $(\hat{y}^{(s)}, \hat{y}^{(b)})$
+\STATE $z^{(s)}, z^{(b)}, h^{(s)}, h^{(b)} \gets f_\theta(x)$ \COMMENT{Forward pass}
+\STATE \textbf{// Superclass prediction}
+\STATE $S^{(s)} \gets \min_c (h^{(s)} - \boldsymbol{\mu}_c^{(s)})^\top (\boldsymbol{\Sigma}^{(s)})^{-1} (h^{(s)} - \boldsymbol{\mu}_c^{(s)})$
+\IF{$S^{(s)} > \tau^{(s)}$}
+    \STATE $\hat{y}^{(s)} \gets \text{NOVEL}$
+\ELSE
+    \STATE $\hat{y}^{(s)} \gets \arg\max_k z_k^{(s)}$
+\ENDIF
+\STATE \textbf{// Subclass prediction}
+\STATE $S^{(b)} \gets \min_c (h^{(b)} - \boldsymbol{\mu}_c^{(b)})^\top (\boldsymbol{\Sigma}^{(b)})^{-1} (h^{(b)} - \boldsymbol{\mu}_c^{(b)})$
+\IF{$S^{(b)} > \tau^{(b)}$}
+    \STATE $\hat{y}^{(b)} \gets \text{NOVEL}$
+\ELSE
+    \STATE $\hat{y}^{(b)} \gets \arg\max_k z_k^{(b)}$
+\ENDIF
+\IF{$S^{(s)} > \tau^{(s)}$}
+    \STATE $\hat{y}^{(b)} \gets \text{NOVEL}$ \COMMENT{Superclass-novel implies subclass-novel}
+\ENDIF
+\RETURN $(\hat{y}^{(s)}, \hat{y}^{(b)})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Threshold Calibration}
+
+Selecting appropriate thresholds $\tau^{(s)}$ and $\tau^{(b)}$ is critical. We employ two strategies:
+
+\paragraph{Leave-One-Superclass-Out (LOSO) for Superclass Threshold} We train three models, each holding out one superclass as pseudo-OOD. For each fold, we compute OOD scores for in-distribution and held-out samples, then optimize the threshold to maximize F1 score. The final threshold is the average across folds:
+\begin{equation}
+    \tau^{(s)} = \frac{1}{3} \sum_{i=1}^{3} \tau_i^{(s)*}
+\end{equation}
+
+\paragraph{Holdout Subclass Validation for Subclass Threshold} We reserve 3 subclasses per superclass (9 total) as pseudo-OOD during training. The threshold $\tau^{(b)}$ is selected to maximize F1 on the holdout subclasses.
+
+\section{Experiments}
+
+\subsection{Dataset}
+
+We use the Novelty Hunter benchmark containing animal images across three superclasses:
+\begin{itemize}
+    \item \textbf{Training set}: 6,288 images across 87 subclasses (29 per superclass)
+    \item \textbf{Test set}: 11,180 images including novel superclasses and subclasses
+\end{itemize}
+
+The class distribution is: birds (29.4\%), dogs (33.1\%), and reptiles (37.4\%).
+
+\subsection{Implementation Details}
+
+\paragraph{Training} We use AdamW optimizer with learning rate $10^{-4}$ for heads and $10^{-5}$ for the backbone. Training proceeds for 50 epochs with batch size 16 (effective batch size 64 with gradient accumulation). We employ cosine annealing with warm restarts ($T_0=10$, $T_{\text{mult}}=2$) and 3 epochs of linear warmup.
+
+\paragraph{Augmentation} Training augmentations include RandAugment ($N=2$, $M=9$), random horizontal flip, color jitter, random erasing (20\%), and Mixup ($\alpha=0.2$).
+
+\paragraph{OOD Detection} For Mahalanobis, we use tied covariance across classes with $10^{-5}$ regularization. We found that raw Mahalanobis distances outperform normalized scores, likely because normalization compresses the score distribution and reduces discriminative power at the tails. For energy-based detection, we use temperature $T=1.0$. Thresholds are initially calibrated via LOSO for superclass and holdout validation for subclass, then adjusted slightly based on validation performance.
+
+\subsection{Main Results}
+
+\begin{table}[t]
+\centering
+\caption{Performance comparison of Mahalanobis and Energy-based OOD detection. All values are percentages. Best results in \textbf{bold}.}
+\label{tab:main_results}
+\begin{tabular}{lcccccc}
+\toprule
+\multirow{2}{*}{Method} & \multicolumn{3}{c}{Superclass Accuracy} & \multicolumn{3}{c}{Subclass Accuracy} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-7}
+ & Overall & Seen & Unseen & Overall & Seen & Unseen \\
+\midrule
+Mahalanobis & \textbf{94.3} & \textbf{95.3} & \textbf{91.8} & \textbf{82.0} & \textbf{96.7} & 78.0 \\
+Energy & 66.3 & 75.7 & 42.6 & 81.1 & 80.7 & \textbf{81.2} \\
+\midrule
+$\Delta$ & +28.0 & +19.6 & +49.2 & +0.9 & +16.0 & -3.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table \ref{tab:main_results} presents our main results. Key findings:
+
+\begin{enumerate}
+    \item \textbf{Mahalanobis dominates at superclass level}: The feature-space method achieves 91.8\% accuracy on unseen superclasses compared to only 42.6\% for energy-based detection---a gap of 49.2 percentage points.
+
+    \item \textbf{Energy is competitive for unseen subclasses}: Surprisingly, energy-based detection slightly outperforms Mahalanobis on unseen subclass detection (81.2\% vs 78.0\%).
+
+    \item \textbf{Mahalanobis better on seen classes}: For both seen superclasses (+19.6\%) and seen subclasses (+16.0\%), Mahalanobis achieves higher accuracy, indicating better classification of in-distribution samples.
+\end{enumerate}
+
+\subsection{Agreement Analysis}
+
+To understand \textit{what} each method detects as novel, we analyze prediction overlap when the Energy detector is calibrated to match the Mahalanobis detector's superclass novelty rate.
+
+\begin{table}[t]
+\centering
+\caption{Agreement between Mahalanobis and Energy predictions when calibrated to the same superclass novelty rate (29.2\% novel superclass for both; 61.8\% vs 67.7\% novel subclass).}
+\label{tab:agreement}
+\begin{tabular}{lcc}
+\toprule
+Metric & Superclass & Subclass \\
+\midrule
+Overall Agreement & 66.6\% & 87.7\% \\
+Both Predict Novel & 12.5\% & 58.6\% \\
+Mahalanobis-only Novel & 16.7\% & 3.2\% \\
+Energy-only Novel & 16.7\% & 9.1\% \\
+\textbf{Overlap Ratio} & \textbf{27.3\%} & \textbf{82.6\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table \ref{tab:agreement} reveals a striking pattern: despite matching superclass novelty rates, the methods disagree substantially at the superclass level (only 27.3\% overlap) but agree well at the subclass level (82.6\% overlap).
+
+\subsection{LOSO Cross-Validation Results}
+
+\begin{table}[t]
+\centering
+\caption{Leave-One-Superclass-Out validation results for threshold calibration.}
+\label{tab:loso}
+\begin{tabular}{lccc}
+\toprule
+Score Type & Threshold & AUROC & F1 \\
+\midrule
+Mahalanobis (raw) & 2881.8 & \textbf{1.000} & \textbf{0.999} \\
+Mahalanobis (normalized) & 1.0 & 0.982 & 0.994 \\
+Energy (normalized) & 0.165 & 0.660 & 0.900 \\
+Energy (raw) & -1.569 & 0.662 & 0.900 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[!htb]
+    \centering
+    \includegraphics[width=0.55\textwidth]{figures/auroc_comparison.pdf}
+    \caption{AUROC comparison for superclass OOD detection across different scoring methods. Raw Mahalanobis distance achieves near-perfect separation (AUROC=1.0), while energy-based methods struggle (AUROC$\approx$0.66). The dashed line indicates random baseline performance.}
+    \label{fig:auroc}
+\end{figure}
+
+Table \ref{tab:loso} and Figure~\ref{fig:auroc} show that Mahalanobis achieves near-perfect separation (AUROC=1.0) between in-distribution and OOD superclasses in LOSO validation, while energy-based detection struggles (AUROC=0.66).
+
+\section{Analysis}
+
+\subsection{Why Does Mahalanobis Excel at Superclass Novelty?}
+
+We hypothesize that Mahalanobis distance captures \textbf{semantic} distance in feature space, while energy captures \textbf{prediction uncertainty}.
+
+\begin{conjecture}[Semantic vs. Epistemic OOD]
+\label{conj:semantic}
+Let $\mathcal{D}_{\text{train}}$ be the training distribution and $x$ be a test sample. Define:
+\begin{itemize}
+    \item \textbf{Semantic OOD}: $x$ belongs to a category semantically distant from all training categories
+    \item \textbf{Epistemic OOD}: $x$ causes high uncertainty due to ambiguity among known classes
+\end{itemize}
+Then Mahalanobis distance is a better detector of semantic OOD, while energy-based scoring better captures epistemic OOD.
+\end{conjecture}
+
+\textbf{Evidence}: Novel superclasses (e.g., fish) are semantically distant from all training superclasses. However, a fish may still activate ``reptile'' or ``dog'' neurons due to shared visual features (eyes, skin texture), leading to confident (low energy) but incorrect predictions. In contrast, Mahalanobis measures distance in feature space, detecting that the fish representation lies far from all class-conditional Gaussians.
+
+For novel subclasses (e.g., a new dog breed), the sample is semantically \textit{close} to known classes but causes uncertainty across similar breeds---exactly the scenario where energy-based detection excels.
+
+\subsection{Confusion Pattern Analysis}
+
+\begin{figure}[!htb]
+    \centering
+    \includegraphics[width=0.65\textwidth]{figures/confusion_matrix.pdf}
+    \caption{Confusion matrix showing agreement between Mahalanobis (rows) and Energy (columns) predictions at the superclass level. Diagonal entries indicate agreement; off-diagonal entries show disagreements. Notable: 1,867 samples where Mahalanobis predicts ``dog'' but Energy predicts ``novel'' (top-right of dog row), while birds show perfect agreement.}
+    \label{fig:confusion}
+\end{figure}
+
+Analysis of the confusion matrix between methods (Figure~\ref{fig:confusion}) reveals:
+\begin{itemize}
+    \item All 1,867 samples that Mahalanobis classifies as ``dog'' but Energy calls ``novel'' suggest Energy has a higher false positive rate on dogs
+    \item When Mahalanobis predicts ``bird'', Energy always agrees (no cases of Mahalanobis=bird with Energy$\neq$bird), suggesting birds are distinctive in both feature and output space
+    \item Energy's aggressive novelty detection on dogs/reptiles may indicate these classes have higher intra-class variance in output space
+\end{itemize}
+
+\FloatBarrier  % Ensure all figures appear before this point
+
+\section{Limitations and Future Work}
+
+\paragraph{Limitations}
+\begin{itemize}
+    \item Our analysis is limited to a single dataset with three superclasses
+    \item Threshold calibration requires held-out OOD data, which may not always be available
+    \item We do not explore combining Mahalanobis and Energy scores
+\end{itemize}
+
+\paragraph{Future Work}
+\begin{itemize}
+    \item Investigate learned combination of feature-space and output-space OOD scores
+    \item Extend to deeper hierarchies with more than two levels
+    \item Explore uncertainty quantification methods (ensembles, MC dropout)
+\end{itemize}
+
+\section{Conclusion}
+
+We presented Novelty Hunter, a hierarchical classification system with OOD detection at multiple semantic granularities. Our comprehensive comparison of Mahalanobis distance and energy-based detection reveals a clear dichotomy: Mahalanobis excels at detecting semantically distant novel categories (superclass novelty), while energy-based methods are competitive for fine-grained novelty within known categories. This insight provides practical guidance: practitioners should select OOD detection methods based on the expected granularity of novel samples. Feature-space methods like Mahalanobis are preferable when novel samples may come from entirely new domains, while output-space methods may suffice when novelty occurs within known semantic categories.
+
+\bibliography{references}
+\bibliographystyle{plainnat}
+
+\newpage
+\appendix
+
+\section{Algorithm for Energy-Based Detection}
+
+\begin{algorithm}[h]
+\caption{Hierarchical Novelty Detection with Energy Scores}
+\label{alg:energy}
+\begin{algorithmic}[1]
+\REQUIRE Test image $x$, trained model $f_\theta$, temperature $T$, thresholds $\tau^{(s)}, \tau^{(b)}$
+\ENSURE Predictions $(\hat{y}^{(s)}, \hat{y}^{(b)})$
+\STATE $z^{(s)}, z^{(b)} \gets f_\theta(x)$ \COMMENT{Forward pass, get logits}
+\STATE \textbf{// Superclass prediction}
+\STATE $E^{(s)} \gets -T \cdot \log \sum_{k=1}^{K^{(s)}} \exp(z_k^{(s)} / T)$ \COMMENT{Energy score}
+\IF{$E^{(s)} > \tau^{(s)}$}
+    \STATE $\hat{y}^{(s)} \gets \text{NOVEL}$
+\ELSE
+    \STATE $\hat{y}^{(s)} \gets \arg\max_k z_k^{(s)}$
+\ENDIF
+\STATE \textbf{// Subclass prediction}
+\STATE $E^{(b)} \gets -T \cdot \log \sum_{k=1}^{K^{(b)}} \exp(z_k^{(b)} / T)$
+\IF{$E^{(b)} > \tau^{(b)}$}
+    \STATE $\hat{y}^{(b)} \gets \text{NOVEL}$
+\ELSE
+    \STATE $\hat{y}^{(b)} \gets \arg\max_k z_k^{(b)}$
+\ENDIF
+\IF{$E^{(s)} > \tau^{(s)}$}
+    \STATE $\hat{y}^{(b)} \gets \text{NOVEL}$ \COMMENT{Superclass-novel implies subclass-novel}
+\ENDIF
+\RETURN $(\hat{y}^{(s)}, \hat{y}^{(b)})$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Detailed Architecture}
+
+\begin{table}[h]
+\centering
+\caption{Detailed model architecture specifications.}
+\label{tab:architecture}
+\begin{tabular}{lll}
+\toprule
+Component & Layer & Dimensions \\
+\midrule
+\multirow{3}{*}{Backbone} & ViT-Base/16 & $224 \times 224 \times 3 \rightarrow 768$ \\
+& Patch size & $16 \times 16$ \\
+& Attention heads & 12 \\
+\midrule
+\multirow{4}{*}{Superclass Head} & Linear + LN + GELU & $768 \rightarrow 512$ \\
+& Dropout & $p = 0.1$ \\
+& Linear + LN + GELU & $512 \rightarrow 256$ \\
+& Output Linear & $256 \rightarrow 3$ \\
+\midrule
+\multirow{4}{*}{Subclass Head} & Linear + LN + GELU & $768 \rightarrow 512$ \\
+& Dropout & $p = 0.1$ \\
+& Linear + LN + GELU & $512 \rightarrow 256$ \\
+& Output Linear & $256 \rightarrow 87$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Training Hyperparameters}
+
+\begin{table}[h]
+\centering
+\caption{Training hyperparameters.}
+\label{tab:hyperparams}
+\begin{tabular}{ll}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Optimizer & AdamW \\
+Head learning rate & $10^{-4}$ \\
+Backbone learning rate & $10^{-5}$ \\
+Weight decay & 0.01 \\
+Batch size & 16 (effective 64) \\
+Epochs & 50 \\
+Warmup epochs & 3 \\
+Scheduler & Cosine Annealing w/ Warm Restarts \\
+$T_0$ & 10 \\
+$T_{\text{mult}}$ & 2 \\
+Label smoothing & 0.1 \\
+Focal loss $\gamma$ & 2.0 \\
+Mixup $\alpha$ & 0.2 \\
+RandAugment $(N, M)$ & $(2, 9)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}
